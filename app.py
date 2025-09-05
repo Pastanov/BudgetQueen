@@ -1,85 +1,83 @@
 from flask import Flask, request, abort
 from twilio.twiml.messaging_response import MessagingResponse
-import os
-import logging
-import re
+import os, logging, re
 
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 
-# סטייט פר-משתמש
-# amounts נשמרים תמיד ב-ILS (שקלים). מציגים לפי display_currency.
-STATE = {}  # { "whatsapp:+9725...": {"budget":int,"remaining":int,"destination":str,"expenses":[(ils_amt,desc)],"rates":{...},"display_currency":"ILS"} }
-
+# ─────────── state & currency helpers ───────────
+STATE = {}  # amounts saved internally in ILS
 DEFAULT_RATES = {"ILS": 1.0, "USD": 3.7, "EUR": 4.0}
 CURRENCY_SYMBOL = {"ILS": "₪", "USD": "$", "EUR": "€"}
-
 ALIASES = {
     "שקל": "ILS", 'ש"ח': "ILS", "שח": "ILS", "₪": "ILS", "ils": "ILS",
     "דולר": "USD", "$": "USD", "usd": "USD", "dollar": "USD",
     "יורו": "EUR", "אירו": "EUR", "eur": "EUR", "euro": "EUR", "€": "EUR",
 }
 
-def get_user_state(from_number: str):
-    if from_number not in STATE:
-        STATE[from_number] = {
-            "budget": 0,           # ב-ILS
-            "remaining": 0,        # ב-ILS
-            "destination": "",
-            "expenses": [],        # [(amount_ils, desc)]
-            "rates": DEFAULT_RATES.copy(),
-            "display_currency": "ILS",  # איך להציג למשתמש
+def get_user_state(num: str):
+    if num not in STATE:
+        STATE[num] = {
+            "budget": 0, "remaining": 0, "destination": "",
+            "expenses": [], "rates": DEFAULT_RATES.copy(),
+            "display_currency": "ILS",
         }
-    return STATE[from_number]
+    return STATE[num]
 
-def reply(text: str):
+def tw_reply(text: str):
     resp = MessagingResponse()
     resp.message(text)
     return str(resp)
 
 def normalize_currency(word: str):
-    word = word.strip().lower()
-    return ALIASES.get(word, None)
+    return ALIASES.get(word.strip().lower())
 
 def detect_currency_from_text(text: str, default_cur: str):
     t = text
-    # לפי סימן
     if "€" in t: return "EUR"
     if "$" in t: return "USD"
     if "₪" in t or 'ש"ח' in t or "שח" in t: return "ILS"
-    # לפי מילים
     for k, v in ALIASES.items():
         if k in t.lower():
             return v
     return default_cur
 
+def detect_target_currency(text: str):
+    t = text.lower()
+    if any(w in t for w in ["בשקלים", "לשקלים", "שקלים", "בשקל"]): return "ILS"
+    if any(w in t for w in ["בדולרים", "לדולרים", "בדולר", "לדולר"]): return "USD"
+    if any(w in t for w in ["ביורו", "ליורו", "באירו", "לאירו"]): return "EUR"
+    # גם סמלים:
+    if "₪" in t: return "ILS"
+    if "$" in t: return "USD"
+    if "€" in t: return "EUR"
+    return None
+
 def parse_amount(text: str):
-    # מחלץ את המספר הראשון (גם אם יש פסיקים/נקודה)
     m = re.search(r"(\d[\d,\.]*)", text)
     if not m:
         raise ValueError("no number")
     raw = m.group(1).replace(",", "")
-    # מתירים מספרים שלמים (נמיר ל-int)
-    val = float(raw)
-    return int(round(val))
+    return int(round(float(raw)))
 
 def to_ils(amount: int, currency: str, rates: dict):
-    r = rates.get(currency, 1.0)
-    return int(round(amount * r))
+    return int(round(amount * float(rates.get(currency, 1.0))))
 
 def from_ils(amount_ils: int, currency: str, rates: dict):
-    r = rates.get(currency, 1.0)
-    return int(round(amount_ils / r))
+    return int(round(amount_ils / float(rates.get(currency, 1.0))))
 
 def fmt(amount_ils: int, st):
     cur = st["display_currency"]
     shown = from_ils(amount_ils, cur, st["rates"])
     sym = CURRENCY_SYMBOL.get(cur, "")
-    # אם ILS, נשים את הסימן אחרי מספר בעברית
-    if cur == "ILS":
-        return f"{shown} {sym}".strip()
-    return f"{sym}{shown}".strip()
+    return f"{shown} {sym}" if cur == "ILS" else f"{sym}{shown}"
 
+def fmt_in(amount_ils: int, cur: str, st):
+    shown = from_ils(amount_ils, cur, st["rates"])
+    sym = CURRENCY_SYMBOL.get(cur, "")
+    return f"{shown} {sym}" if cur == "ILS" else f"{sym}{shown}"
+
+# ─────────── routes ───────────
 @app.route("/", methods=["GET"])
 def home():
     return "Budget Queen WhatsApp Bot - OK", 200
@@ -97,58 +95,52 @@ def whatsapp():
 
     st = get_user_state(from_number)
     expenses = st["expenses"]
-
     logging.info("Incoming | From=%s | Body=%r", from_number, body_raw)
 
-    # ===== פקודות =====
+    # ─────────── commands ───────────
 
-    # איפוס
+    # Reset
     if text in ["איפוס", "reset", "start", "התחלה"]:
         STATE[from_number] = {
             "budget": 0, "remaining": 0, "destination": "",
             "expenses": [], "rates": DEFAULT_RATES.copy(), "display_currency": "ILS"
         }
-        return reply('🔄 אופסנו הכול. כתבי: "תקציב: 3000" או "יעד: אתונה"\nטיפ: אפשר גם "מטבע: דולר/יורו/שקל"')
+        return tw_reply('🔄 אופסנו הכול. כדי להתחיל: "תקציב: 3000" או "יעד: אתונה"\nטיפ: אפשר גם "מטבע: דולר/יורו/שקל"')
 
-    # מטבע: ... (בחירת מטבע תצוגה/קלט ברירת מחדל)
-    # דוגמאות: מטבע: דולר | מטבע: USD | מטבע: €
+    # Display currency
     if text.startswith("מטבע"):
         try:
             word = body_raw.split(":", 1)[1].strip()
             cur = normalize_currency(word) or detect_currency_from_text(word, st["display_currency"])
-            if cur not in ["ILS", "USD", "EUR"]:
-                raise ValueError()
+            if cur not in ["ILS", "USD", "EUR"]: raise ValueError()
             st["display_currency"] = cur
-            return reply(f"🎯 מעכשיו מציגים ב־{cur} ({CURRENCY_SYMBOL.get(cur,'')}).\nשערים נוכחיים: USD={st['rates']['USD']} | EUR={st['rates']['EUR']}. אפשר לשנות עם: שער: USD=3.65")
+            return tw_reply(f"🎯 מציגים מעכשיו ב־{cur} ({CURRENCY_SYMBOL.get(cur,'')}).\nשערים: USD={st['rates']['USD']} | EUR={st['rates']['EUR']}. לשינוי: \"שער: USD=3.65, EUR=3.95\"")
         except Exception:
-            return reply('כתבי כך: מטבע: דולר / יורו / שקל (או USD/EUR/ILS)')
+            return tw_reply('כתבי כך: מטבע: דולר / יורו / שקל (או USD/EUR/ILS)')
 
-    # שער: USD=3.7  או  שער: EUR=4.0
+    # Rates
     if text.startswith("שער"):
         try:
-            rhs = body_raw.split(":", 1)[1].strip()
-            # תומך בכמה עדכונים: "שער: USD=3.6, EUR=4"
+            rhs = body_raw.split(":", 1)[1]
             pairs = re.findall(r"(USD|EUR|ILS)\s*=\s*([\d\.]+)", rhs, re.IGNORECASE)
-            if not pairs:
-                raise ValueError()
+            if not pairs: raise ValueError()
             for cur, rate in pairs:
                 st["rates"][cur.upper()] = float(rate)
-            return reply(f"עודכן. שערים: USD={st['rates']['USD']} | EUR={st['rates']['EUR']} | ILS=1")
+            return tw_reply(f"עודכן. שערים: USD={st['rates']['USD']} | EUR={st['rates']['EUR']} | ILS=1")
         except Exception:
-            return reply('כתבי כך: שער: USD=3.7  או  שער: EUR=4.0  (אפשר גם שניהם עם פסיק)')
+            return tw_reply('כתבי כך: שער: USD=3.7  או  שער: EUR=4.0  (אפשר גם שניהם בפסיק)')
 
-    # יעד: ...
+    # Destination
     if text.startswith("יעד"):
         try:
             dest = body_raw.split(":", 1)[1].strip()
-            if not dest:
-                raise ValueError("empty")
+            if not dest: raise ValueError()
             st["destination"] = dest
-            return reply(f"מעולה! יעד הוגדר: {dest} ✈️")
+            return tw_reply(f"מעולה! יעד הוגדר: {dest} ✈️")
         except Exception:
-            return reply('כתבי כך: יעד: <שם יעד>\nלדוגמה: יעד: אתונה')
+            return tw_reply('כתבי כך: יעד: <שם יעד>\nלדוגמה: יעד: אתונה')
 
-    # תקציב: 3000 (אפשר במטבע כלשהו, לדוגמה: תקציב: $2000, תקציב: 1500€)
+    # Budget (supports $, €, ₪)
     if text.startswith("תקציב"):
         try:
             val_part = body_raw.split(":", 1)[1].strip()
@@ -158,20 +150,37 @@ def whatsapp():
             st["budget"] = amount_ils
             st["remaining"] = amount_ils
             st["expenses"] = []
-            return reply(f"הוגדר תקציב {fmt(amount_ils, st)}. נשאר: {fmt(st['remaining'], st)}.")
+            st["display_currency"] = cur  # switch display to budget currency if specified
+            src_sym = CURRENCY_SYMBOL.get(cur, "")
+            src_txt = f"{src_sym}{amount}" if cur != "ILS" else f"{amount} ₪"
+            return tw_reply(f"הוגדר תקציב {fmt(amount_ils, st)} (מקור: {src_txt}). נשאר: {fmt(st['remaining'], st)}.")
         except Exception:
-            return reply('כתבי כך: תקציב: <סכום>\nדוגמאות: תקציב: 3000 | תקציב: $2000 | תקציב: 1500€')
+            return tw_reply('כתבי כך: תקציב: <סכום>\nדוגמאות: תקציב: 3000 | תקציב: $2000 | תקציב: 1500€')
 
-    # מחק אחרון
+    # Conversion Q: "כמה זה 50$ בשקלים?" / "כמה זה 200 ₪ בדולרים?"
+    if "כמה זה" in text:
+        try:
+            amount = parse_amount(body_raw)
+            src_cur = detect_currency_from_text(body_raw, st["display_currency"])
+            tgt_cur = detect_target_currency(body_raw) or st["display_currency"]
+            amount_ils = to_ils(amount, src_cur, st["rates"])
+            converted = fmt_in(amount_ils, tgt_cur, st)
+            src_sym = CURRENCY_SYMBOL.get(src_cur, "")
+            src_txt = f"{src_sym}{amount}" if src_cur != "ILS" else f"{amount} ₪"
+            return tw_reply(f"{src_txt} שווה ~ {converted} לפי השערים הנוכחיים (USD={st['rates']['USD']}, EUR={st['rates']['EUR']}).")
+        except Exception:
+            return tw_reply('דוגמה: "כמה זה 50$ בשקלים?" | "כמה זה 200 ₪ בדולרים?" | "כמה זה 30€ בשקלים?"')
+
+    # Delete last
     if body_raw == "מחק אחרון":
         if expenses:
-            last_amt_ils, last_desc = expenses.pop()
-            st["remaining"] += last_amt_ils
-            return reply(f"הוצאה אחרונה נמחקה ({fmt(last_amt_ils, st)} – {last_desc}). נשאר: {fmt(st['remaining'], st)}.")
+            last_amt, last_desc = expenses.pop()
+            st["remaining"] += last_amt
+            return tw_reply(f"הוצאה אחרונה נמחקה ({fmt(last_amt, st)} – {last_desc}). נשאר: {fmt(st['remaining'], st)}.")
         else:
-            return reply("אין הוצאות למחוק.")
+            return tw_reply("אין הוצאות למחוק.")
 
-    # מחק <סכום>  (מחפש לפי סכום במטבע התצוגה/סימן בהודעה)
+    # Delete amount
     if text.startswith("מחק "):
         try:
             cur = detect_currency_from_text(body_raw, st["display_currency"])
@@ -182,61 +191,65 @@ def whatsapp():
                     desc = expenses[i][1]
                     expenses.pop(i)
                     st["remaining"] += target_ils
-                    return reply(f"הוצאה של {fmt(target_ils, st)} ({desc}) נמחקה. נשאר: {fmt(st['remaining'], st)}.")
-            return reply(f"לא נמצאה הוצאה בסך {fmt(target_ils, st)}.")
+                    return tw_reply(f"הוצאה של {fmt(target_ils, st)} ({desc}) נמחקה. נשאר: {fmt(st['remaining'], st)}.")
+            return tw_reply(f"לא נמצאה הוצאה בסך {fmt(target_ils, st)}.")
         except Exception:
-            return reply('כתבי כך: מחק 120  |  מחק $10  |  מחק 8€')
+            return tw_reply('כתבי כך: מחק 120  |  מחק $10  |  מחק 8€')
 
-    # עדכן X ל-Y  (תומך בסימנים/מטבעות שונים)
+    # Update X to Y
     if text.startswith("עדכן"):
         try:
-            # נשלוף שני סכומים (הישן והחדש)
             nums = re.findall(r"(\d[\d,\.]*)", body_raw)
-            if len(nums) < 2:
-                raise ValueError()
+            if len(nums) < 2: raise ValueError()
             old_amt = int(round(float(nums[0].replace(",", ""))))
             new_amt = int(round(float(nums[1].replace(",", ""))))
-            old_cur = detect_currency_from_text(body_raw, st["display_currency"])
-            new_cur = old_cur  # אם אין ציון נפרד, נניח אותו מטבע
-            old_ils = to_ils(old_amt, old_cur, st["rates"])
-            new_ils = to_ils(new_amt, new_cur, st["rates"])
+            cur = detect_currency_from_text(body_raw, st["display_currency"])
+            old_ils = to_ils(old_amt, cur, st["rates"])
+            new_ils = to_ils(new_amt, cur, st["rates"])
             for i in range(len(expenses) - 1, -1, -1):
                 if expenses[i][0] == old_ils:
                     desc = expenses[i][1]
                     expenses[i] = (new_ils, desc)
                     st["remaining"] += (old_ils - new_ils)
-                    return reply(f"הוצאה עודכנה: {fmt(old_ils, st)} → {fmt(new_ils, st)}. נשאר: {fmt(st['remaining'], st)}.")
-            return reply(f"לא נמצאה הוצאה של {fmt(old_ils, st)} לעדכן.")
+                    note = ""
+                    if st["remaining"] < 0:
+                        note = f"\n⚠️ שימי לב: במינוס {fmt(abs(st['remaining']), st)}"
+                    return tw_reply(f"הוצאה עודכנה: {fmt(old_ils, st)} → {fmt(new_ils, st)}. נשאר: {fmt(st['remaining'], st)}.{note}")
+            return tw_reply(f"לא נמצאה הוצאה של {fmt(old_ils, st)} לעדכן.")
         except Exception:
-            return reply('הפורמט: עדכן 50 ל-70  |  עדכן $12 ל-$9  |  עדכן 10€ ל-8€')
+            return tw_reply('הפורמט: עדכן 50 ל-70  |  עדכן $12 ל-$9  |  עדכן 10€ ל-8€')
 
-    # הוצאות
-    if body_raw == "הוצאות":
+    # Report (detailed)
+    if body_raw in ["הוצאות", "סיכום"]:
         if expenses:
             lines = [f"{i+1}. {fmt(amt, st)} – {desc}" for i, (amt, desc) in enumerate(expenses)]
             total_ils = sum(amt for amt, _ in expenses)
-            lines.append(f"\nסה\"כ הוצאות: {fmt(total_ils, st)}")
-            lines.append(f"נשאר: {fmt(st['remaining'], st)}")
+            lines += [
+                f"\nסה\"כ הוצאות: {fmt(total_ils, st)}",
+                f"יתרה: {fmt(st['remaining'], st)}" + (f"  ⚠️ מינוס {fmt(abs(st['remaining']), st)}" if st["remaining"] < 0 else ""),
+            ]
+            if st["budget"] > 0:
+                lines.append(f"תקציב: {fmt(st['budget'], st)}")
             if st["destination"]:
                 lines.append(f"יעד: {st['destination']}")
             lines.append(f"מטבע תצוגה: {st['display_currency']} (USD={st['rates']['USD']} | EUR={st['rates']['EUR']})")
-            return reply("\n".join(lines))
+            return tw_reply("\n".join(lines))
         else:
-            return reply("עדיין לא נרשמו הוצאות.")
+            base = f"יתרה: {fmt(st['remaining'], st)}"
+            if st["remaining"] < 0:
+                base += f"  ⚠️ מינוס {fmt(abs(st['remaining']), st)}"
+            return tw_reply("עדיין לא נרשמו הוצאות.\n" + base)
 
-    # הוספת הוצאה — כל הודעה עם מספר (תומך בסימנים/מטבע)
+    # Add expense (allow minus)
     if any(ch.isdigit() for ch in body_raw):
         if st["budget"] == 0:
-            return reply('קודם צריך להגדיר תקציב 📝\nכתבי: תקציב: 3000 או תקציב: $2000')
+            return tw_reply('קודם צריך להגדיר תקציב 📝\nכתבי: תקציב: 3000 או תקציב: $2000')
         try:
             cur = detect_currency_from_text(body_raw, st["display_currency"])
             amount = parse_amount(body_raw)
             amount_ils = to_ils(amount, cur, st["rates"])
 
-            if amount_ils > st["remaining"]:
-                return reply(f"הסכום {fmt(amount_ils, st)} גדול מהיתרה ({fmt(st['remaining'], st)}). נסי סכום קטן יותר או עדכני תקציב.")
-
-            # תיאור אחרי '–' או '-'
+            # description
             if "–" in body_raw:
                 description = body_raw.split("–", 1)[1].strip()
             elif "-" in body_raw:
@@ -246,12 +259,20 @@ def whatsapp():
 
             expenses.append((amount_ils, description))
             st["remaining"] -= amount_ils
-            return reply(f"נוספה הוצאה: {fmt(amount_ils, st)} – {description}\nנשאר: {fmt(st['remaining'], st)}.")
-        except Exception:
-            return reply("לא הצלחתי לזהות את הסכום, נסי שוב 🙂")
 
-    # ברירת מחדל
-    return reply('כדי להתחיל: "תקציב: 3000" או "יעד: אתונה"\nפקודות: "מטבע: דולר/יורו/שקל", "שער: USD=3.65", "הוצאות", "מחק אחרון", "מחק 120", "עדכן 50 ל-70", "איפוס"')
+            note = ""
+            if st["remaining"] < 0:
+                note = f"\n⚠️ שימי לב: במינוס {fmt(abs(st['remaining']), st)}"
+
+            return tw_reply(f"נוספה הוצאה: {fmt(amount_ils, st)} – {description}\nנשאר: {fmt(st['remaining'], st)}.{note}")
+        except Exception:
+            return tw_reply("לא הצלחתי לזהות את הסכום, נסי שוב 🙂")
+
+    # Help
+    return tw_reply('כדי להתחיל: "תקציב: 3000" או "יעד: אתונה"\n'
+                    'פקודות: "מטבע: דולר/יורו/שקל", "שער: USD=3.65", '
+                    '"כמה זה 50$ בשקלים?", "הוצאות"/"סיכום", '
+                    '"מחק אחרון", "מחק 120", "עדכן 50 ל-70", "איפוס"')
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3000))
