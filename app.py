@@ -4,18 +4,18 @@ import os
 
 app = Flask(__name__)
 
-# סטייט לפי מספר משתמש
+# סטייט (בזיכרון) פר-משתמש לפי המספר שלו
 STATE = {}  # { "whatsapp:+9725...": {"budget":0,"remaining":0,"destination":"","expenses":[(amt,desc)]} }
 
 def get_user_state(from_number: str):
     if from_number not in STATE:
-        STATE[from_number] = {
-            "budget": 0,
-            "remaining": 0,
-            "destination": "",
-            "expenses": []
-        }
+        STATE[from_number] = {"budget": 0, "remaining": 0, "destination": "", "expenses": []}
     return STATE[from_number]
+
+def _reply(text: str):
+    resp = MessagingResponse()
+    resp.message(text)
+    return resp
 
 @app.route("/", methods=["GET"])
 def home():
@@ -28,33 +28,36 @@ def whatsapp_bot():
 
     from_number = request.form.get("From", "")
     incoming_msg = (request.form.get("Body") or "").strip()
-
     if not from_number:
         abort(400)
 
     st = get_user_state(from_number)
     expenses = st["expenses"]
-
     text = incoming_msg.lower()
 
-    # יעד: פריז
+    # --- איפוס מהיר ---
+    if incoming_msg in ["איפוס", "reset", "start", "התחלה"]:
+        STATE[from_number] = {"budget": 0, "remaining": 0, "destination": "", "expenses": []}
+        return str(_reply("🔄 אופסנו הכול. כתבי: תקציב: 3000 או יעד: אתונה"))
+
+    # יעד: ...
     if text.startswith("יעד"):
         try:
-            destination = incoming_msg.split(":", 1)[1].strip()
-            st["destination"] = destination
-            return str(_reply(f"מעולה! יעד הוגדר: {destination}"))
+            dest = incoming_msg.split(":", 1)[1].strip()
+            st["destination"] = dest
+            return str(_reply(f"מעולה! יעד הוגדר: {dest} ✈️"))
         except:
             return str(_reply("כתבי כך: יעד: <שם יעד>"))
 
-    # תקציב: 3000
+    # תקציב: 3000  (מאפס הוצאות קודמות!)
     if text.startswith("תקציב"):
         try:
             val = incoming_msg.split(":", 1)[1]
-            val = val.replace('ש"ח', "").replace("₪", "").strip()
+            val = val.replace('ש"ח', "").replace("₪", "").replace(",", "").strip()
             budget = int(val)
             st["budget"] = budget
             st["remaining"] = budget
-            st["expenses"] = []
+            st["expenses"] = []  # <<< חשוב: מאפס רשימת הוצאות ישנה
             return str(_reply(f"הוגדר תקציב {budget} ₪. נשאר: {budget} ₪."))
         except:
             return str(_reply("כתבי כך: תקציב: <סכום>"))
@@ -64,7 +67,7 @@ def whatsapp_bot():
         if expenses:
             last_amt, last_desc = expenses.pop()
             st["remaining"] += last_amt
-            return str(_reply(f"הוצאה אחרונה נמחקה ({last_amt} ₪ – {last_desc}). נשאר {st['remaining']} ₪."))
+            return str(_reply(f"הוצאה אחרונה נמחקה ({last_amt} ₪ – {last_desc}). נשאר: {st['remaining']} ₪."))
         else:
             return str(_reply("אין הוצאות למחוק."))
 
@@ -77,7 +80,7 @@ def whatsapp_bot():
                     desc = expenses[i][1]
                     expenses.pop(i)
                     st["remaining"] += amount
-                    return str(_reply(f"הוצאה של {amount} ₪ ({desc}) נמחקה. נשאר {st['remaining']} ₪."))
+                    return str(_reply(f"הוצאה של {amount} ₪ ({desc}) נמחקה. נשאר: {st['remaining']} ₪."))
             return str(_reply(f"לא נמצאה הוצאה בסך {amount} ₪."))
         except:
             return str(_reply("כתבי כך: מחק <סכום>"))
@@ -93,7 +96,7 @@ def whatsapp_bot():
                     desc = expenses[i][1]
                     expenses[i] = (new_amount, desc)
                     st["remaining"] += (old_amount - new_amount)
-                    return str(_reply(f"הוצאה עודכנה: {old_amount} → {new_amount}. נשאר {st['remaining']} ₪."))
+                    return str(_reply(f"הוצאה עודכנה: {old_amount} → {new_amount}. נשאר: {st['remaining']} ₪."))
             return str(_reply(f"לא נמצאה הוצאה של {old_amount} ₪ לעדכן."))
         except:
             return str(_reply("הפורמט: עדכן <סכום ישן> ל-<סכום חדש>"))
@@ -111,7 +114,7 @@ def whatsapp_bot():
         else:
             return str(_reply("עדיין לא נרשמו הוצאות."))
 
-    # הוספת הוצאה – כל הודעה עם מספר (למשל: "120 – קפה")
+    # הוספת הוצאה – כל הודעה עם מספר
     if any(ch.isdigit() for ch in incoming_msg):
         try:
             digits = "".join(ch for ch in incoming_msg if ch.isdigit())
@@ -128,12 +131,8 @@ def whatsapp_bot():
         except:
             return str(_reply("לא הצלחתי לזהות את הסכום, נסי שוב 🙂"))
 
-    return str(_reply("כדי להתחיל כתבי: יעד: ___ או תקציב: ___\nלדוגמה: תקציב: 3000"))
-
-def _reply(text: str):
-    resp = MessagingResponse()
-    resp.message(text)
-    return resp
+    # ברירת מחדל
+    return str(_reply('כדי להתחיל: "תקציב: 3000" או "יעד: אתונה"\nפקודות: "הוצאות", "מחק אחרון", "מחק 120", "עדכן 50 ל-70", "איפוס"'))
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 3000))
