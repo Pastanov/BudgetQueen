@@ -47,7 +47,6 @@ def detect_target_currency(text: str):
     if any(w in t for w in ["בשקלים", "לשקלים", "שקלים", "בשקל"]): return "ILS"
     if any(w in t for w in ["בדולרים", "לדולרים", "בדולר", "לדולר"]): return "USD"
     if any(w in t for w in ["ביורו", "ליורו", "באירו", "לאירו"]): return "EUR"
-    # גם סמלים:
     if "₪" in t: return "ILS"
     if "$" in t: return "USD"
     if "€" in t: return "EUR"
@@ -105,7 +104,7 @@ def whatsapp():
             "budget": 0, "remaining": 0, "destination": "",
             "expenses": [], "rates": DEFAULT_RATES.copy(), "display_currency": "ILS"
         }
-        return tw_reply('🔄 אופסנו הכול. כדי להתחיל: "תקציב: 3000" או "יעד: אתונה"\nטיפ: אפשר גם "מטבע: דולר/יורו/שקל"')
+        return tw_reply('🔄 אופסנו הכול. כדי להתחיל: "תקציב 3000" או "יעד: אתונה"\nטיפ: אפשר גם "מטבע: דולר/יורו/שקל"')
 
     # Display currency
     if text.startswith("מטבע"):
@@ -140,22 +139,26 @@ def whatsapp():
         except Exception:
             return tw_reply('כתבי כך: יעד: <שם יעד>\nלדוגמה: יעד: אתונה')
 
-    # Budget (supports $, €, ₪)
+    # Budget (supports "תקציב 3000", "תקציב: $2000", "תקציב 1500€")
     if text.startswith("תקציב"):
         try:
-            val_part = body_raw.split(":", 1)[1].strip()
+            # מסיר "תקציב", נקודתיים ורווחים – כדי לאפשר גם בלי נקודתיים
+            val_part = re.sub(r"^תקציב[:\s]*", "", body_raw, flags=re.IGNORECASE).strip()
+
             cur = detect_currency_from_text(val_part, st["display_currency"])
             amount = parse_amount(val_part)
             amount_ils = to_ils(amount, cur, st["rates"])
+
             st["budget"] = amount_ils
             st["remaining"] = amount_ils
             st["expenses"] = []
-            st["display_currency"] = cur  # switch display to budget currency if specified
+            st["display_currency"] = cur  # אם צויין מטבע – נציג בו
+
             src_sym = CURRENCY_SYMBOL.get(cur, "")
             src_txt = f"{src_sym}{amount}" if cur != "ILS" else f"{amount} ₪"
             return tw_reply(f"הוגדר תקציב {fmt(amount_ils, st)} (מקור: {src_txt}). נשאר: {fmt(st['remaining'], st)}.")
         except Exception:
-            return tw_reply('כתבי כך: תקציב: <סכום>\nדוגמאות: תקציב: 3000 | תקציב: $2000 | תקציב: 1500€')
+            return tw_reply('אפשר לכתוב גם בלי נקודתיים 🙂\nדוגמאות: תקציב 3000 | תקציב $2000 | תקציב 1500€')
 
     # Conversion Q: "כמה זה 50$ בשקלים?" / "כמה זה 200 ₪ בדולרים?"
     if "כמה זה" in text:
@@ -211,15 +214,13 @@ def whatsapp():
                     desc = expenses[i][1]
                     expenses[i] = (new_ils, desc)
                     st["remaining"] += (old_ils - new_ils)
-                    note = ""
-                    if st["remaining"] < 0:
-                        note = f"\n⚠️ שימי לב: במינוס {fmt(abs(st['remaining']), st)}"
+                    note = f"\n⚠️ שימי לב: במינוס {fmt(abs(st['remaining']), st)}" if st["remaining"] < 0 else ""
                     return tw_reply(f"הוצאה עודכנה: {fmt(old_ils, st)} → {fmt(new_ils, st)}. נשאר: {fmt(st['remaining'], st)}.{note}")
             return tw_reply(f"לא נמצאה הוצאה של {fmt(old_ils, st)} לעדכן.")
         except Exception:
             return tw_reply('הפורמט: עדכן 50 ל-70  |  עדכן $12 ל-$9  |  עדכן 10€ ל-8€')
 
-    # Report (detailed)
+    # Report (detailed) — also "סיכום"
     if body_raw in ["הוצאות", "סיכום"]:
         if expenses:
             lines = [f"{i+1}. {fmt(amt, st)} – {desc}" for i, (amt, desc) in enumerate(expenses)]
@@ -240,36 +241,36 @@ def whatsapp():
                 base += f"  ⚠️ מינוס {fmt(abs(st['remaining']), st)}"
             return tw_reply("עדיין לא נרשמו הוצאות.\n" + base)
 
-    # Add expense (allow minus)
+    # Add expense (allow minus) — תומך גם ב"הוצאה ..." וגם בלי
     if any(ch.isdigit() for ch in body_raw):
         if st["budget"] == 0:
-            return tw_reply('קודם צריך להגדיר תקציב 📝\nכתבי: תקציב: 3000 או תקציב: $2000')
+            return tw_reply('קודם צריך להגדיר תקציב 📝\nכתבי: תקציב 3000 או תקציב $2000')
         try:
-            cur = detect_currency_from_text(body_raw, st["display_currency"])
-            amount = parse_amount(body_raw)
+            # מסיר "הוצאה" בתחילת הטקסט אם הופיעה (עם/בלי נקודתיים/רווח)
+            cleaned = re.sub(r"^הוצאה[:\s]*", "", body_raw, flags=re.IGNORECASE).strip()
+
+            cur = detect_currency_from_text(cleaned, st["display_currency"])
+            amount = parse_amount(cleaned)
             amount_ils = to_ils(amount, cur, st["rates"])
 
             # description
-            if "–" in body_raw:
-                description = body_raw.split("–", 1)[1].strip()
-            elif "-" in body_raw:
-                description = body_raw.split("-", 1)[1].strip()
+            if "–" in cleaned:
+                description = cleaned.split("–", 1)[1].strip()
+            elif "-" in cleaned:
+                description = cleaned.split("-", 1)[1].strip()
             else:
                 description = "הוצאה"
 
             expenses.append((amount_ils, description))
             st["remaining"] -= amount_ils
 
-            note = ""
-            if st["remaining"] < 0:
-                note = f"\n⚠️ שימי לב: במינוס {fmt(abs(st['remaining']), st)}"
-
+            note = f"\n⚠️ שימי לב: במינוס {fmt(abs(st['remaining']), st)}" if st["remaining"] < 0 else ""
             return tw_reply(f"נוספה הוצאה: {fmt(amount_ils, st)} – {description}\nנשאר: {fmt(st['remaining'], st)}.{note}")
         except Exception:
             return tw_reply("לא הצלחתי לזהות את הסכום, נסי שוב 🙂")
 
     # Help
-    return tw_reply('כדי להתחיל: "תקציב: 3000" או "יעד: אתונה"\n'
+    return tw_reply('כדי להתחיל: "תקציב 3000" או "יעד: אתונה"\n'
                     'פקודות: "מטבע: דולר/יורו/שקל", "שער: USD=3.65", '
                     '"כמה זה 50$ בשקלים?", "הוצאות"/"סיכום", '
                     '"מחק אחרון", "מחק 120", "עדכן 50 ל-70", "איפוס"')
