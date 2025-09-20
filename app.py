@@ -16,9 +16,21 @@ try:
     from redis import Redis
     REDIS_URL = os.getenv("REDIS_URL")
     if REDIS_URL:
-        r = Redis.from_url(REDIS_URL, decode_responses=True)
-        USE_REDIS = True
-        log.info("Redis enabled ✅")
+        # rediss://... מומלץ
+        r = Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+        )
+        try:
+            r.ping()  # מאמתים חיבור
+            USE_REDIS = True
+            log.info("Redis enabled ✅")
+        except Exception as e:
+            r = None
+            USE_REDIS = False
+            log.warning("Redis ping failed; falling back to in-memory ⚠️ %s", e)
     else:
         log.warning("REDIS_URL not set; falling back to in-memory state ⚠️")
 except Exception as e:
@@ -37,23 +49,26 @@ ALIASES = {
 # מפה בסיסית: מילת מפתח -> קטגוריה
 CATEGORY_MAP = {
     # אוכל/שתייה
-    "קפה": "אוכל", "פיצה": "אוכל", "מסעדה": "אוכל", "אוכל": "אוכל", "בריושט": "אוכל",
-    "שתיה": "אוכל", "משקה": "אוכל", "גלידה": "אוכל", "סופר": "אוכל", "מכולת": "אוכל", "מאפה": "אוכל",
+    "קפה": "אוכל", "פיצה": "אוכל", "מסעדה": "אוכל", "אוכל": "אוכל",
+    "שתיה": "אוכל", "משקה": "אוכל", "גלידה": "אוכל", "סופר": "אוכל",
+    "מכולת": "אוכל", "מאפה": "אוכל", "בירה": "אוכל", "יין": "אוכל",
     # תחבורה
-    "מונית": "תחבורה", "טקסי": "תחבורה", "אובר": "תחבורה", "uber": "תחבורה", "בולט": "תחבורה",
-    "רכבת": "תחבורה", "אוטובוס": "תחבורה", "תחבורה": "תחבורה", "דלק": "תחבורה", "דלקים": "תחבורה",
+    "מונית": "תחבורה", "טקסי": "תחבורה", "אובר": "תחבורה", "uber": "תחבורה",
+    "בולט": "תחבורה", "bolt": "תחבורה", "רכבת": "תחבורה", "אוטובוס": "תחבורה",
+    "דלק": "תחבורה", "חנייה": "תחבורה",
     # קניות
-    "שמלה": "קניות", "חולצה": "קניות", "בגד": "קניות", "בגדים": "קניות", "סנדלים": "קניות",
-    "נעל": "קניות", "נעליים": "קניות", "קניות": "קניות", "מתנה": "קניות", "גאדג'ט": "קניות",
+    "שמלה": "קניות", "חולצה": "קניות", "בגד": "קניות", "בגדים": "קניות",
+    "סנדלים": "קניות", "נעל": "קניות", "נעליים": "קניות", "קניות": "קניות",
+    "מתנה": "קניות", "גאדג'ט": "קניות", "שופינג": "קניות",
     # לינה
     "מלון": "לינה", "הוסטל": "לינה", "airbnb": "לינה", "דירה": "לינה", "לינה": "לינה",
     # אטרקציות
-    "מוזיאון": "אטרקציות", "פארק": "אטרקציות", "כניסה": "אטרקציות", "סיור": "אטרקציות", "שייט": "אטרקציות",
+    "מוזיאון": "אטרקציות", "פארק": "אטרקציות", "כניסה": "אטרקציות", "סיור": "אטרקציות",
+    "שייט": "אטרקציות", "אטרקציה": "אטרקציות",
     # בריאות/ביטוח
     "ביטוח": "בריאות", "תרופה": "בריאות", "רופא": "בריאות", "בדיקה": "בריאות",
     # תקשורת
     "סים": "תקשורת", "טלפון": "תקשורת", "חבילת גלישה": "תקשורת", "wifi": "תקשורת",
-    # אחר
 }
 
 # ===== In-memory fallback =====
@@ -71,18 +86,22 @@ def redis_key(num): return f"user:{num}"
 
 def load_state(num: str):
     if USE_REDIS:
-        raw = r.get(redis_key(num))
-        if raw:
-            return json.loads(raw)
-        return default_state()
-    # fallback
+        try:
+            raw = r.get(redis_key(num))
+            if raw:
+                return json.loads(raw)
+        except Exception as e:
+            log.warning("Redis read failed, using memory: %s", e)
     return MEM_STATE.get(num, default_state())
 
 def save_state(num: str, st: dict):
     if USE_REDIS:
-        r.set(redis_key(num), json.dumps(st))
-    else:
-        MEM_STATE[num] = st
+        try:
+            r.set(redis_key(num), json.dumps(st))
+            return
+        except Exception as e:
+            log.warning("Redis write failed, using memory: %s", e)
+    MEM_STATE[num] = st
 
 # ===== Helpers =====
 def tw_reply(text: str):
@@ -140,10 +159,6 @@ def guess_category(description: str):
         if kw in d:
             return cat
     return "אחר"
-
-def warm(text: str):
-    # שכבת חום קלה (אימוג'יז/מילים טובות)
-    return text
 
 # ===== Routes =====
 @app.route("/", methods=["GET"])
@@ -211,7 +226,7 @@ def whatsapp():
         except Exception:
             return tw_reply('לא הבנתי? נסי כך: "יעד: לונדון"')
 
-    # Budget (supports "תקציב 3000" / "$2000" / "1500€")
+    # Budget  ("תקציב 3000" / "$2000" / "1500€")
     if text.startswith("תקציב"):
         try:
             val_part = re.sub(r"^תקציב[:\s]*", "", body_raw, flags=re.IGNORECASE).strip()
@@ -222,7 +237,7 @@ def whatsapp():
             st["budget"] = amount_ils
             st["remaining"] = amount_ils
             st["expenses"] = []
-            st["display_currency"] = cur  # מציגות במטבע של התקציב שהוגדר
+            st["display_currency"] = cur
             save_state(from_number, st)
 
             src_sym = CURRENCY_SYMBOL.get(cur, "")
@@ -231,7 +246,7 @@ def whatsapp():
         except Exception:
             return tw_reply('לא הבנתי? נסי: "תקציב 3000" / "תקציב $2000" / "תקציב 1500€"')
 
-    # Conversion question
+    # Conversion
     if "כמה זה" in text:
         try:
             amount = parse_amount(body_raw)
@@ -256,7 +271,7 @@ def whatsapp():
         else:
             return tw_reply("אין מה למחוק 🗑️")
 
-    # Delete by amount (in display / with symbol)
+    # Delete by amount
     if text.startswith("מחק "):
         try:
             cur = detect_currency_from_text(body_raw, st["display_currency"])
@@ -267,7 +282,7 @@ def whatsapp():
                     it = expenses.pop(i)
                     st["remaining"] += target_ils
                     save_state(from_number, st)
-                    return tw_reply(f"❌ נמחקה הוצאה: {fmt(target_ils, st)} – {it['desc']} ({it['cat']})\נשאר: {fmt(st['remaining'], st)}")
+                    return tw_reply(f"❌ נמחקה הוצאה: {fmt(target_ils, st)} – {it['desc']} ({it['cat']})\nנשאר: {fmt(st['remaining'], st)}")
             return tw_reply(f"לא מצאתי הוצאה בסך {fmt(target_ils, st)} 🤷‍♀️")
         except Exception:
             return tw_reply('לא הבנתי? נסי: "מחק 120" / "מחק $10" / "מחק 8€"')
@@ -295,74 +310,54 @@ def whatsapp():
         except Exception:
             return tw_reply('לא הבנתי? נסי: "עדכן 50 ל-70" / "עדכן $12 ל-$9" / "עדכן 10€ ל-8€"')
 
-    # Summary (also "הוצאות")
-    if body_raw in ["סיכום", "הוצאות"]:
-        if expenses:
-            lines = []
-            by_cat = {}
-            total_ils = 0
-            for it in expenses:
-                lines.append(f"- {fmt(it['amt_ils'], st)} – {it['desc']} ({it['cat']})")
-                total_ils += it["amt_ils"]
-                by_cat[it["cat"]] = by_cat.get(it["cat"], 0) + it["amt_ils"]
-
-            cat_lines = [f"{cat}: {fmt(val, st)}" for cat, val in sorted(by_cat.items(), key=lambda x: -x[1])]
-            msg = []
-            msg.append("📊 סיכום חמוד:")
-            msg.extend(lines)
-            msg.append(f"\nסה\"כ הוצאות: {fmt(total_ils, st)}")
-            msg.append(f"יתרה: {fmt(st['remaining'], st)}" + (f"  ⚠️ מינוס {fmt(abs(st['remaining']), st)}" if st["remaining"] < 0 else ""))
-            if st["budget"] > 0: msg.append(f"תקציב: {fmt(st['budget'], st)}")
-            if st["destination"]: msg.append(f"יעד: {st['destination']}")
-            msg.append("\nלפי קטגוריות:")
-            msg.extend(cat_lines)
-            return tw_reply("\n".join(msg))
-        else:
-            base = f"יתרה: {fmt(st['remaining'], st)}"
-            if st["remaining"] < 0: base += f"  ⚠️ מינוס {fmt(abs(st['remaining']), st)}"
-            return tw_reply("עדיין לא נרשמו הוצאות.\n" + base)
-
-    # Add expense — supports "הוצאה ..." וגם טקסט חופשי עם מספר
+    # ===== Add expense (improved) =====
     if any(ch.isdigit() for ch in body_raw):
         if st["budget"] == 0:
             return tw_reply("📝 קודם מגדירות תקציב, סיס! נסי: תקציב 3000 או תקציב $2000")
         try:
+            # מסיר "הוצאה" בתחילת הטקסט אם צריך
             cleaned = re.sub(r"^הוצאה[:\s]*", "", body_raw, flags=re.IGNORECASE).strip()
 
+            # מזהה מטבע וסכום
             cur = detect_currency_from_text(cleaned, st["display_currency"])
-            amount = parse_amount(cleaned)
-            amt_ils = to_ils(amount, cur, st["rates"])
+            amt = parse_amount(cleaned)
+            amt_ils = to_ils(amt, cur, st["rates"])
 
-            # description
-            if "–" in cleaned:
-                desc = cleaned.split("–", 1)[1].strip()
-            elif "-" in cleaned:
-                desc = cleaned.split("-", 1)[1].strip()
-            else:
-                # אם היה טקסט אחרי המספר — נשתמש בו
-                parts = re.split(r"\d[\d,\.]*", cleaned, maxsplit=1)
-                desc = parts[1].strip() if len(parts) > 1 and parts[1].strip() else "הוצאה"
+            # בונה תאור: כל מה שאחרי המספר – בלי מילות המטבע
+            after_number = re.split(r"\d[\d,\.]*", cleaned, maxsplit=1)
+            desc = after_number[1].strip() if len(after_number) > 1 else ""
+            desc = re.sub(r"^\s*(דולר|יורו|אירו|שקל|ש\"ח|₪|\$|€)\s*", "", desc, flags=re.IGNORECASE)
+            if not desc:
+                # אולי בא עם מפריד "–" או "-"
+                if "–" in cleaned:
+                    desc = cleaned.split("–", 1)[1].strip()
+                elif "-" in cleaned:
+                    desc = cleaned.split("-", 1)[1].strip()
+                if not desc:
+                    desc = "הוצאה"
 
             cat = guess_category(desc)
+
             expenses.append({"amt_ils": amt_ils, "desc": desc, "cat": cat})
             st["remaining"] -= amt_ils
             save_state(from_number, st)
 
-            # הודעות חמות
             extra = ""
             if cat == "אוכל": extra = " בתיאבון! 😋"
             elif cat == "קניות": extra = " תתחדשי! ✨"
             elif cat in ["תחבורה", "לינה"]: extra = " נסיעה טובה! 🧳"
-
             note = f"\n⚠️ כרגע במינוס {fmt(abs(st['remaining']), st)}" if st["remaining"] < 0 else ""
+
             return tw_reply(f"➕ נוספה הוצאה: {fmt(amt_ils, st)} – {desc} ({cat})\nנשאר: {fmt(st['remaining'], st)}{note}{extra}")
-        except Exception:
-            return tw_reply("לא הצלחתי להבין את ההוצאה 😅\nלדוגמה: \"הוצאה 50₪ – קפה\" / \"10$ – מונית\" / \"120 – שמלה\"")
+
+        except Exception as e:
+            logging.exception("add-expense failed: %s", e)
+            return tw_reply("לא הצלחתי להבין את ההוצאה 😅\nדוגמאות:\n• הוצאה 20$ – פיצה\n• 20 דולר פיצה\n• 120 – שמלה\n• 15€ – קפה")
 
     # Unknown command — friendly fallback
     return tw_reply("לא הבנתי עדיין 🫣 נסי לנסח כך:\n"
                     "• תקציב 3000  |  תקציב $2000\n"
-                    "• הוצאה 50₪ – קפה  |  10$ – מונית  |  120 – שמלה\n"
+                    "• הוצאה 50₪ – קפה  |  20 דולר פיצה  |  120 – שמלה\n"
                     "• סיכום  |  מחק אחרון  |  מחק 120  |  עדכן 50 ל-70\n"
                     "• יעד: לונדון  |  מטבע: דולר  |  שער: USD=3.65")
 
