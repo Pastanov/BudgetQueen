@@ -6,7 +6,7 @@ import requests
 app = Flask(__name__)
 
 # הכתובת של ה-App Script שלך (להדביק פה!)
-GOOGLE_SHEET_URL = "https://script.google.com/macros/s/XXXXXX/exec"
+GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbyuGcPyJ97ZXY7AUcrIt9DwRQIGxn6isvvEBzzqMb4BDeFB76YIuX0l1XgmLL4GrT1Z/exec"
 
 # תגובות חמודות לקטגוריות
 fun_responses = {
