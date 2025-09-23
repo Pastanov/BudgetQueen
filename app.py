@@ -155,26 +155,18 @@ def ensure_self_trip(num):
             save_trip(code, st)
     return code, st
 
-# --- NEW: convert current trip to group, preserving data ---
+# --- convert current trip to group, preserving data ---
 def ensure_group_for_trip(owner_number: str, active_code: str, st: dict):
-    """
-    אם הטיול הנוכחי הוא SELF:<מספר>, ממירות אותו לקבוצה עם קוד חדש
-    ושומרות את כל התקציב/יתרה/הוצאות/שמות/יעד/שערים. מחזיר (code, state).
-    """
     if not active_code.startswith("SELF:"):
-        return active_code, st  # already a group
-
-    new_st = json.loads(json.dumps(st))  # shallow deep-copy
+        return active_code, st
+    new_st = json.loads(json.dumps(st))
     code = random_code()
     new_st["code"] = code
-    members = list(set(new_st.get("members", []) + [owner_number]))
-    new_st["members"] = members
+    new_st["members"] = list(set(new_st.get("members", []) + [owner_number]))
     save_trip(code, new_st)
-
     user = load_user(owner_number) or {}
     user["active_trip"] = code
     save_user(owner_number, user)
-
     return code, new_st
 
 # ===== Currency helpers =====
@@ -243,7 +235,7 @@ def whatsapp():
     if request.method == "GET":
         return "Webhook is ready", 200
 
-    # ---- keep Redis alive (reconnect if needed) ----
+    # keep Redis alive (reconnect if needed)
     global r, USE_REDIS
     if r is not None:
         try:
@@ -256,7 +248,7 @@ def whatsapp():
                                    health_check_interval=30, retry_on_timeout=True)
                 r.ping()
                 USE_REDIS = True
-            except Exception as _:
+            except Exception:
                 log.warning("Redis temporarily unavailable; continuing in-memory")
                 USE_REDIS = False
 
@@ -267,7 +259,7 @@ def whatsapp():
         if not from_number:
             abort(400)
 
-        # ---- load user & active trip ----
+        # load user & active trip
         user = load_user(from_number)
         active_code = user.get("active_trip")
         if not active_code or active_code.startswith("SELF:"):
@@ -286,8 +278,6 @@ def whatsapp():
         log.info("Incoming | From=%s | Trip=%s | Body=%r", from_number, active_code, body_raw)
 
         # ===== Group management =====
-
-        # Share code for current trip (convert SELF->group without losing data)
         if text in ["שתף קוד", "קוד קבוצה", "שיתוף", "שתפי קוד", "שתף"]:
             code, st2 = ensure_group_for_trip(from_number, active_code, st)
             active_code, st = code, st2
@@ -295,10 +285,9 @@ def whatsapp():
             return tw_reply(
                 "הנה הקוד לקבוצה ✨\n"
                 f"🔑 {code}\n\n"
-                "כדי לצרף שותף/ה, תני/ני להם את המספר של הסנדבוקס והקוד—שישלחו: 'הצטרף " + code + "'"
+                "כדי לצרף שותף/ה—תני/ני להם את מספר הסנדבוקס והקוד. שישלחו: 'הצטרף " + code + "'"
             )
 
-        # Invite wording (same behavior as share code)
         if text.startswith("הוסף משתתף") or text.startswith("הזמן"):
             code, st2 = ensure_group_for_trip(from_number, active_code, st)
             active_code, st = code, st2
@@ -306,10 +295,9 @@ def whatsapp():
             return tw_reply(
                 "יאללה, מוסיפים חברה לטיול! 🥳\n"
                 f"קוד: {code}\n"
-                "שהשותף/ה ישלח/תשלח לוואטסאפ של הסנדבוקס: 'הצטרף " + code + "'"
+                "שהשותף/ה ישלח/תשלח לסנדבוקס: 'הצטרף " + code + "'"
             )
 
-        # Create a new, empty group (with warning)
         if text.startswith("פתח קבוצה"):
             name = re.sub(r"^פתח קבוצה[:\s]*", "", body_raw).strip() or "טיול"
             code = random_code()
@@ -319,15 +307,13 @@ def whatsapp():
             new_st["names"][from_number] = new_st["names"].get(from_number, "אני")
             new_st["code"] = code
             save_trip(code, new_st)
-
             user["active_trip"] = code
             save_user(from_number, user)
-
             return tw_reply(
-                "שימי לב 💡 פעולה זו פתחה קבוצה חדשה **מאפס**.\n"
-                "אם רצית לשתף את הטיול הקיים עם כל ההיסטוריה—כתבי במקום זאת: 'שתף קוד'.\n\n"
+                "שימי לב 💡 זה פתח קבוצה **חדשה מאפס**.\n"
+                "אם רצית לשתף את הטיול הקיים עם ההיסטוריה—כתבי: 'שתף קוד'.\n\n"
                 f"נוצרה קבוצה: {name}\n🔑 קוד: {code}\n"
-                "שתפי את הקוד עם השותפים כדי שיצטרפו ('הצטרף " + code + "')."
+                "שתפי את הקוד כדי שיצטרפו ('הצטרף " + code + "')."
             )
 
         if text.startswith("הצטרף"):
@@ -342,7 +328,7 @@ def whatsapp():
                 save_trip(code, st2)
             user["active_trip"] = code
             save_user(from_number, user)
-            return tw_reply(f"✨ הצטרפת לקבוצה! יעד: {st2.get('destination') or 'ללא'}\nחברי קבוצה: {len(st2['members'])}\nאפשר להגדיר תקציב/להוסיף הוצאות כרגיל.")
+            return tw_reply(f"✨ הצטרפת! יעד: {st2.get('destination') or 'ללא'}\nחברי קבוצה: {len(st2['members'])}\nאפשר להגדיר תקציב/להוסיף הוצאות כרגיל.")
 
         if text.startswith("החלף קבוצה"):
             m = re.search(r"\b([A-Za-z0-9]{4,10})\b", body_raw)
@@ -360,7 +346,7 @@ def whatsapp():
             return tw_reply("👯 חברי קבוצה:\n" + "\n".join(f"• {s}" for s in shown))
 
         if text in ["התנתק", "התנתק מקבוצה"]:
-            code, st_self = ensure_self_trip(from_number)
+            code, _st = ensure_self_trip(from_number)
             user["active_trip"] = code
             save_user(from_number, user)
             return tw_reply("נותקת מהקבוצה. חזרת לטיול אישי 🧘‍♀️")
@@ -443,19 +429,18 @@ def whatsapp():
                 cur = detect_currency_from_text(val_part, st["display_currency"])
                 amount = parse_first_amount(val_part)
                 amount_ils = to_ils(amount, cur, st["rates"])
-
                 st["budget"] = amount_ils
                 st["remaining"] = amount_ils
                 st["expenses"] = []
                 st["display_currency"] = cur
                 save_trip(active_code, st)
-
                 src_sym = CURRENCY_SYMBOL.get(cur, "")
                 src_txt = f"{src_sym}{amount}" if cur != "ILS" else f"{amount} ₪"
                 return tw_reply(f"💰 הוגדר תקציב {fmt(amount_ils, st)} (מקור: {src_txt}).\nנשאר: {fmt(st['remaining'], st)}")
             except Exception:
                 return tw_reply('לא הבנתי? נסי: "תקציב 3000" / "תקציב $2000" / "תקציב 1500€"')
 
+        # המרות: "כמה זה ..."
         if "כמה זה" in text:
             try:
                 amount = parse_first_amount(body_raw)
@@ -562,7 +547,6 @@ def whatsapp():
                 cur = detect_currency_from_text(body_raw, st["display_currency"])
                 old_ils = to_ils(old_amt, cur, st["rates"])
                 new_ils = to_ils(new_amt, cur, st["rates"])
-
                 for i in range(len(expenses) - 1, -1, -1):
                     if expenses[i]["amt_ils"] == old_ils:
                         desc = expenses[i]["desc"]; cat = expenses[i]["cat"]; who = expenses[i].get("added_by", "")
@@ -585,7 +569,6 @@ def whatsapp():
                     lines.append(f"{idx}. {fmt(it['amt_ils'], st)} – {it['desc']} ({it['cat']})" + (f" • {who}" if who else ""))
                     total_ils += it["amt_ils"]
                     by_cat[it["cat"]] = by_cat.get(it["cat"], 0) + it["amt_ils"]
-
                 cat_lines = [f"{cat}: {fmt(val, st)}" for cat, val in sorted(by_cat.items(), key=lambda x: -x[1])]
                 msg = []
                 msg.append("📊 סיכום חמוד:")
@@ -609,44 +592,35 @@ def whatsapp():
                 return tw_reply("📝 קודם מגדירות תקציב, סיס! נסי: תקציב 3000 או תקציב $2000")
             try:
                 cleaned = re.sub(r"^הוצאה[:\s]*", "", body_raw, flags=re.IGNORECASE).strip()
-
                 m = re.search(r"(\d[\d,\.]*)", cleaned)
                 if not m: raise ValueError("no number")
                 num_span_end = m.end()
                 cur = detect_currency_from_text(cleaned, st["display_currency"])
                 amt = parse_first_amount(cleaned)
                 amt_ils = to_ils(amt, cur, st["rates"])
-
                 desc = cleaned[num_span_end:].strip()
-                desc = re.sub(r"^[\s\-–:.,]*(דולר|יורו|אירו|שקל|ש\"ח|₪|\$|€)?[\ס\-–:.,]*", "", desc, flags=re.IGNORECASE)
+                desc = re.sub(r"^[\s\-–:.,]*(דולר|יורו|אירו|שקל|ש\"ח|₪|\$|€)?[\s\-–:.,]*", "", desc, flags=re.IGNORECASE)
                 if not desc:
                     desc = "הוצאה"
-
                 cat = guess_category(desc)
-
                 expenses.append({"amt_ils": amt_ils, "desc": desc, "cat": cat, "added_by": from_number})
                 st["remaining"] -= amt_ils
                 save_trip(active_code, st)
-
                 extra = ""
                 if cat == "אוכל": extra = " בתיאבון! 😋"
                 elif cat == "קניות": extra = " תתחדשי! ✨"
                 elif cat in ["תחבורה", "לינה"]: extra = " נסיעה טובה! 🧳"
                 note = f"\n⚠️ כרגע במינוס {fmt(abs(st['remaining']), st)}" if st["remaining"] < 0 else ""
-
                 return tw_reply(f"➕ נוספה הוצאה: {fmt(amt_ils, st)} – {desc} ({cat})\nנשאר: {fmt(st['remaining'], st)}{note}{extra}")
-
             except Exception as e:
                 logging.exception("add-expense failed: %s", e)
                 return tw_reply("לא הצלחתי להבין את ההוצאה 😅\nדוגמאות:\n• הוצאה 20$ – פיצה\n• 20 דולר פיצה\n• 120 – שמלה\n• 15€ – קפה")
 
-        # ===== Unknown =====
-        return tw_reply("לא הבנתי עדיין 🫣 נסי לנסח כך:\n"
-                        "• שתף קוד  |  קוד קבוצה  |  הוסף משתתף  |  הצטרף ABC123\n"
-                        "• תקציב 3000  |  תקציב $2000  |  יעד: לונדון\n"
-                        "• הוצאה 50₪ – קפה  |  20 דולר פיצה  |  120 – שמלה\n"
-                        "• סיכום  |  מחק אחרון  |  מחק 2  |  מחק 11$  |  מחק משחק\n"
-                        "• מטבע: דולר  |  שער: USD=3.65")
+        # ===== Unknown: SHORT & FRIENDLY =====
+        return tw_reply(
+            "לא בטוחה שהבנתי 🫣\n"
+            "דוגמאות: 💰 תקציב 3000 | 🍕 20$ פיצה | 📊 סיכום | 🗑️ מחק אחרון"
+        )
 
     except Exception as e:
         log.exception("Unhandled error in /whatsapp: %s", e)
