@@ -155,6 +155,28 @@ def ensure_self_trip(num):
             save_trip(code, st)
     return code, st
 
+# --- NEW: convert current trip to group, preserving data ---
+def ensure_group_for_trip(owner_number: str, active_code: str, st: dict):
+    """
+    אם הטיול הנוכחי הוא SELF:<מספר>, ממירות אותו לקבוצה עם קוד חדש
+    ושומרות את כל התקציב/יתרה/הוצאות/שמות/יעד/שערים. מחזיר (code, state).
+    """
+    if not active_code.startswith("SELF:"):
+        return active_code, st  # already a group
+
+    new_st = json.loads(json.dumps(st))  # shallow deep-copy
+    code = random_code()
+    new_st["code"] = code
+    members = list(set(new_st.get("members", []) + [owner_number]))
+    new_st["members"] = members
+    save_trip(code, new_st)
+
+    user = load_user(owner_number) or {}
+    user["active_trip"] = code
+    save_user(owner_number, user)
+
+    return code, new_st
+
 # ===== Currency helpers =====
 def normalize_currency(word: str):
     return ALIASES.get(word.strip().lower())
@@ -263,7 +285,31 @@ def whatsapp():
         st.setdefault("names", {})
         log.info("Incoming | From=%s | Trip=%s | Body=%r", from_number, active_code, body_raw)
 
-        # ===== Group commands =====
+        # ===== Group management =====
+
+        # Share code for current trip (convert SELF->group without losing data)
+        if text in ["שתף קוד", "קוד קבוצה", "שיתוף", "שתפי קוד", "שתף"]:
+            code, st2 = ensure_group_for_trip(from_number, active_code, st)
+            active_code, st = code, st2
+            save_trip(active_code, st)
+            return tw_reply(
+                "הנה הקוד לקבוצה ✨\n"
+                f"🔑 {code}\n\n"
+                "כדי לצרף שותף/ה, תני/ני להם את המספר של הסנדבוקס והקוד—שישלחו: 'הצטרף " + code + "'"
+            )
+
+        # Invite wording (same behavior as share code)
+        if text.startswith("הוסף משתתף") or text.startswith("הזמן"):
+            code, st2 = ensure_group_for_trip(from_number, active_code, st)
+            active_code, st = code, st2
+            save_trip(active_code, st)
+            return tw_reply(
+                "יאללה, מוסיפים חברה לטיול! 🥳\n"
+                f"קוד: {code}\n"
+                "שהשותף/ה ישלח/תשלח לוואטסאפ של הסנדבוקס: 'הצטרף " + code + "'"
+            )
+
+        # Create a new, empty group (with warning)
         if text.startswith("פתח קבוצה"):
             name = re.sub(r"^פתח קבוצה[:\s]*", "", body_raw).strip() or "טיול"
             code = random_code()
@@ -273,9 +319,16 @@ def whatsapp():
             new_st["names"][from_number] = new_st["names"].get(from_number, "אני")
             new_st["code"] = code
             save_trip(code, new_st)
+
             user["active_trip"] = code
             save_user(from_number, user)
-            return tw_reply(f"🎉 נוצרה קבוצה: {name}\nקוד הצטרפות: {code}\nשתפו את הקוד → 'הצטרף {code}'")
+
+            return tw_reply(
+                "שימי לב 💡 פעולה זו פתחה קבוצה חדשה **מאפס**.\n"
+                "אם רצית לשתף את הטיול הקיים עם כל ההיסטוריה—כתבי במקום זאת: 'שתף קוד'.\n\n"
+                f"נוצרה קבוצה: {name}\n🔑 קוד: {code}\n"
+                "שתפי את הקוד עם השותפים כדי שיצטרפו ('הצטרף " + code + "')."
+            )
 
         if text.startswith("הצטרף"):
             m = re.search(r"\b([A-Za-z0-9]{4,10})\b", body_raw)
@@ -300,17 +353,17 @@ def whatsapp():
             save_user(from_number, user)
             return tw_reply(f"בוצע ✅ עברנו לקבוצה {code}")
 
-        if text in ["התנתק", "התנתק מקבוצה"]:
-            code, st_self = ensure_self_trip(from_number)
-            user["active_trip"] = code
-            save_user(from_number, user)
-            return tw_reply("נותקת מהקבוצה. חזרת לטיול אישי 🧘‍♀️")
-
         if text in ["מי בקבוצה", "חברי קבוצה"]:
             members = st.get("members", [])
             if not members: return tw_reply("אין עדיין חברים בקבוצה הזו 🙂")
             shown = [display_name(m, st) for m in members]
             return tw_reply("👯 חברי קבוצה:\n" + "\n".join(f"• {s}" for s in shown))
+
+        if text in ["התנתק", "התנתק מקבוצה"]:
+            code, st_self = ensure_self_trip(from_number)
+            user["active_trip"] = code
+            save_user(from_number, user)
+            return tw_reply("נותקת מהקבוצה. חזרת לטיול אישי 🧘‍♀️")
 
         # ===== Names =====
         if text.startswith("שם:") or text.startswith("שם :"):
@@ -565,7 +618,7 @@ def whatsapp():
                 amt_ils = to_ils(amt, cur, st["rates"])
 
                 desc = cleaned[num_span_end:].strip()
-                desc = re.sub(r"^[\s\-–:.,]*(דולר|יורו|אירו|שקל|ש\"ח|₪|\$|€)?[\s\-–:.,]*", "", desc, flags=re.IGNORECASE)
+                desc = re.sub(r"^[\s\-–:.,]*(דולר|יורו|אירו|שקל|ש\"ח|₪|\$|€)?[\ס\-–:.,]*", "", desc, flags=re.IGNORECASE)
                 if not desc:
                     desc = "הוצאה"
 
@@ -589,12 +642,11 @@ def whatsapp():
 
         # ===== Unknown =====
         return tw_reply("לא הבנתי עדיין 🫣 נסי לנסח כך:\n"
-                        "• פתח קבוצה אתונה  |  הצטרף ABC123  |  מי בקבוצה | שמות: נוי, יובל\n"
-                        "• שם: נוי  |  שם +9725xxxxxxx: יובל\n"
-                        "• תקציב 3000  |  תקציב $2000\n"
+                        "• שתף קוד  |  קוד קבוצה  |  הוסף משתתף  |  הצטרף ABC123\n"
+                        "• תקציב 3000  |  תקציב $2000  |  יעד: לונדון\n"
                         "• הוצאה 50₪ – קפה  |  20 דולר פיצה  |  120 – שמלה\n"
                         "• סיכום  |  מחק אחרון  |  מחק 2  |  מחק 11$  |  מחק משחק\n"
-                        "• יעד: לונדון  |  מטבע: דולר  |  שער: USD=3.65")
+                        "• מטבע: דולר  |  שער: USD=3.65")
 
     except Exception as e:
         log.exception("Unhandled error in /whatsapp: %s", e)
