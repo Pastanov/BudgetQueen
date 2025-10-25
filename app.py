@@ -1,6 +1,8 @@
 from flask import Flask, request, abort
 from twilio.twiml.messaging_response import MessagingResponse
 import os, logging, re, json, random, string
+import requests # <--- הוספנו את ספריית requests
+from requests.exceptions import RequestException # <--- לטיפול שגיאות רשת
 
 # ===== Logging =====
 logging.basicConfig(level=logging.INFO)
@@ -38,7 +40,8 @@ except Exception as e:
     log.warning("Redis import failed; using in-memory state ⚠️ %s", e)
 
 # ===== Constants =====
-DEFAULT_RATES = {"ILS": 1.0, "USD": 3.7, "EUR": 4.0}
+# אלו עכשיו משמשים רק כגיבוי (Fallback)
+DEFAULT_RATES = {"ILS": 1.0, "USD": 3.7, "EUR": 4.0} 
 CURRENCY_SYMBOL = {"ILS": "₪", "USD": "$", "EUR": "€"}
 
 ALIASES = {
@@ -72,19 +75,65 @@ CATEGORY_MAP = {
 }
 
 # ===== In-memory fallback =====
-MEM_TRIPS = {}   # key -> trip state
-MEM_USERS = {}   # phone -> user meta
+MEM_TRIPS = {}    # key -> trip state
+MEM_USERS = {}    # phone -> user meta
+
+# ===== פונקציה חדשה להבאת שערים חיים =====
+def fetch_live_rates():
+    """
+    Fetches live exchange rates for USD and EUR against ILS.
+    Returns a dictionary, falling back to DEFAULT_RATES on any error.
+    """
+    # מתחילים עם ברירת המחדל כגיבוי
+    rates = DEFAULT_RATES.copy() 
+    try:
+        # אנו מגדירים פסק זמן קצר (2 שניות) כדי לא לעכב את הבוט
+        
+        # 1. קבלת שער דולר -> שקל
+        usd_url = "https://api.frankfurter.app/latest?from=USD&to=ILS"
+        resp_usd = requests.get(usd_url, timeout=2.0)
+        resp_usd.raise_for_status() # זורק שגיאה אם הסטטוס הוא 4xx/5xx
+        data_usd = resp_usd.json()
+        if "rates" in data_usd and "ILS" in data_usd["rates"]:
+            rates["USD"] = data_usd["rates"]["ILS"]
+        
+        # 2. קבלת שער יורו -> שקל
+        eur_url = "https://api.frankfurter.app/latest?from=EUR&to=ILS"
+        resp_eur = requests.get(eur_url, timeout=2.0)
+        resp_eur.raise_for_status()
+        data_eur = resp_eur.json()
+        if "rates" in data_eur and "ILS" in data_eur["rates"]:
+            rates["EUR"] = data_eur["rates"]["ILS"]
+
+        log.info(f"Successfully fetched live rates: {rates}")
+        return rates
+
+    except RequestException as e:
+        # תופס שגיאות רשת, פסק זמן, שגיאות HTTP וכו'.
+        log.warning(f"Failed to fetch live rates: {e}. Falling back to defaults.")
+        return DEFAULT_RATES.copy() # מחזיר עותק של ברירת המחדל במקרה של שגיאה
+    except Exception as e:
+        # תופס כל שגיאה אחרת (כמו עיבוד JSON)
+        log.warning(f"Unexpected error fetching rates: {e}. Falling back to defaults.")
+        return DEFAULT_RATES.copy()
+# ==========================================
+
 
 def default_state():
+    log.info("Creating default state, fetching live rates...")
+    # --- שינוי ---
+    # במקום להשתמש בערך הקבוע, אנו קוראים לפונקציה החדשה
+    live_rates = fetch_live_rates() 
+    # -------------
     return {
         "budget": 0,
         "remaining": 0,
         "destination": "",
         "expenses": [],  # {amt_ils:int, desc:str, cat:str, added_by:str}
-        "rates": DEFAULT_RATES.copy(),
+        "rates": live_rates, # <--- משתמשים בשערים המעודכנים
         "display_currency": "ILS",
         "members": [],
-        "names": {},     # phone -> name
+        "names": {},    # phone -> name
         "code": "",
     }
 
@@ -145,7 +194,7 @@ def ensure_self_trip(num):
     code = f"SELF:{num}"
     st = load_trip(code)
     if st is None:
-        st = default_state()
+        st = default_state() # <--- כאן יתבצע ניסיון משיכת שערים
         st["code"] = code
         st["members"] = [num]
         save_trip(code, st)
@@ -202,7 +251,11 @@ def to_ils(amount: int, currency: str, rates: dict):
     return int(round(amount * float(rates.get(currency, 1.0))))
 
 def from_ils(amount_ils: int, currency: str, rates: dict):
-    return int(round(amount_ils / float(rates.get(currency, 1.0))))
+    # הוספנו בדיקה למקרה שהשער הוא 0 כדי למנוע חלוקה באפס
+    rate = float(rates.get(currency, 1.0))
+    if rate == 0:
+        return 0
+    return int(round(amount_ils / rate))
 
 def fmt_in(amount_ils: int, cur: str, st):
     shown = from_ils(amount_ils, cur, st["rates"])
@@ -244,8 +297,8 @@ def whatsapp():
             try:
                 from redis import Redis
                 r = Redis.from_url(os.getenv("REDIS_URL"), decode_responses=True,
-                                   socket_connect_timeout=5, socket_timeout=5,
-                                   health_check_interval=30, retry_on_timeout=True)
+                                    socket_connect_timeout=5, socket_timeout=5,
+                                    health_check_interval=30, retry_on_timeout=True)
                 r.ping()
                 USE_REDIS = True
             except Exception:
@@ -301,7 +354,7 @@ def whatsapp():
         if text.startswith("פתח קבוצה"):
             name = re.sub(r"^פתח קבוצה[:\s]*", "", body_raw).strip() or "טיול"
             code = random_code()
-            new_st = default_state()
+            new_st = default_state() # <--- כאן יתבצע ניסיון משיכת שערים
             new_st["destination"] = name
             new_st["members"] = [from_number]
             new_st["names"][from_number] = new_st["names"].get(from_number, "אני")
@@ -383,12 +436,12 @@ def whatsapp():
 
         # ===== Core commands =====
         if text in ["איפוס", "reset", "start", "התחלה"]:
-            st = default_state()
+            st = default_state() # <--- כאן יתבצע ניסיון משיכת שערים
             st["members"] = [from_number] if active_code.startswith("SELF:") else st.get("members", []) or [from_number]
             st["names"][from_number] = st["names"].get(from_number, "אני")
             st["code"] = active_code
             save_trip(active_code, st)
-            return tw_reply("🔄 אופסנו הכול! יואוו איזה כיף להתחיל נקי ✨\nכתבי: תקציב 3000  או  יעד: אתונה\nטיפ: אפשר גם \"מטבע: דולר/יורו/שקל\"")
+            return tw_reply("🔄 אופסנו הכול! יואוו איזה כיף להתחיל נקי ✨\nכתבי: תקציב 3000  או  יעד: אתונה\nטיפ: אפשר גם \"מטבע: דולר/יורו/שקל\"")
 
         if text.startswith("מטבע"):
             try:
@@ -397,7 +450,10 @@ def whatsapp():
                 if cur not in ["ILS", "USD", "EUR"]: raise ValueError()
                 st["display_currency"] = cur
                 save_trip(active_code, st)
-                return tw_reply(f"💱 מעכשיו מציגות ב־{cur} ({CURRENCY_SYMBOL.get(cur,'')}).\nשערים: USD={st['rates']['USD']} | EUR={st['rates']['EUR']}")
+                # מעגלים את התצוגה ל-3 ספרות אחרי הנקודה
+                usd_rate = round(st['rates']['USD'], 3)
+                eur_rate = round(st['rates']['EUR'], 3)
+                return tw_reply(f"💱 מעכשיו מציגות ב־{cur} ({CURRENCY_SYMBOL.get(cur,'')}).\nשערים: USD={usd_rate} | EUR={eur_rate}")
             except Exception:
                 return tw_reply('לא הבנתי? נסי: "מטבע: דולר" / "מטבע: יורו" / "מטבע: שקל"')
 
@@ -409,7 +465,10 @@ def whatsapp():
                 for cur, rate in pairs:
                     st["rates"][cur.upper()] = float(rate)
                 save_trip(active_code, st)
-                return tw_reply(f"עודכן 👍 שערים: USD={st['rates']['USD']} | EUR={st['rates']['EUR']} | ILS=1")
+                # מעגלים את התצוגה ל-3 ספרות אחרי הנקודה
+                usd_rate = round(st['rates']['USD'], 3)
+                eur_rate = round(st['rates']['EUR'], 3)
+                return tw_reply(f"עודכן 👍 שערים: USD={usd_rate} | EUR={eur_rate} | ILS=1")
             except Exception:
                 return tw_reply('לא הבנתי? נסי: "שער: USD=3.7" או "שער: USD=3.65, EUR=3.95"')
 
@@ -450,7 +509,10 @@ def whatsapp():
                 converted = fmt_in(amount_ils, tgt_cur, st)
                 src_sym = CURRENCY_SYMBOL.get(src_cur, "")
                 src_txt = f"{src_sym}{amount}" if src_cur != "ILS" else f"{amount} ₪"
-                return tw_reply(f"{src_txt} ≈ {converted} לפי שערים: USD={st['rates']['USD']}, EUR={st['rates']['EUR']}")
+                # מעגלים את התצוגה ל-3 ספרות אחרי הנקודה
+                usd_rate = round(st['rates']['USD'], 3)
+                eur_rate = round(st['rates']['EUR'], 3)
+                return tw_reply(f"{src_txt} ≈ {converted} לפי שערים: USD={usd_rate}, EUR={eur_rate}")
             except Exception:
                 return tw_reply('לא הבנתי? דוגמאות: "כמה זה 50$ בשקלים?" / "כמה זה 200 ₪ בדולרים?" / "כמה זה 30€ בשקלים?"')
 
@@ -574,7 +636,7 @@ def whatsapp():
                 msg.append("📊 סיכום חמוד:")
                 msg.extend("• " + ln for ln in lines)
                 msg.append(f"\nסה\"כ הוצאות: {fmt(total_ils, st)}")
-                msg.append(f"יתרה: {fmt(st['remaining'], st)}" + (f"  ⚠️ מינוס {fmt(abs(st['remaining']), st)}" if st["remaining"] < 0 else ""))
+                msg.append(f"יתרה: {fmt(st['remaining'], st)}" + (f"  ⚠️ מינוס {fmt(abs(st['remaining']), st)}" if st["remaining"] < 0 else ""))
                 if st["budget"] > 0: msg.append(f"תקציב: {fmt(st['budget'], st)}")
                 if st["destination"]: msg.append(f"יעד: {st['destination']}")
                 msg.append("\nלפי קטגוריות:")
@@ -583,7 +645,7 @@ def whatsapp():
                 return tw_reply("\n".join(msg))
             else:
                 base = f"יתרה: {fmt(st['remaining'], st)}"
-                if st["remaining"] < 0: base += f"  ⚠️ מינוס {fmt(abs(st['remaining']), st)}"
+                if st["remaining"] < 0: base += f"  ⚠️ מינוס {fmt(abs(st['remaining']), st)}"
                 return tw_reply("עדיין לא נרשמו הוצאות.\n" + base)
 
         # ===== Add expense (first number rule) =====
